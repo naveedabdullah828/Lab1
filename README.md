@@ -51,3 +51,100 @@ Run the test suite (functional + ArchUnit tests):
 ```bash
 ./mvnw test
 ```
+
+## Root Cause Analysis
+Two issues cause the broken output in `Test 2`:
+1. **Missing outer annotation**: `OrderService.placeOrder` is not annotated with `@Auditable(action = AuditableAction.PROCESS_ORDER)`, so `AuditAspect` never binds `PROCESS_ORDER` to `AuditAspect.CURRENT_ACTION`.
+2. **Spring AOP self-invocation trap**: Inside `placeOrder`, calling `this.processPayment(item)` invokes the method directly on the raw `OrderService` target instance (`this`) rather than routing through the Spring CGLIB proxy (`OrderService$$SpringCGLIB$$0`). Because the proxy is bypassed, `AuditAspect` never intercepts `processPayment`, and the `ScopedValue` context remains unchanged.
+
+## Solutions (Compliant with `ArchitectureTest`)
+Because `ArchitectureTest` requires all `@Service` fields to be `final` and packages to be free of cycles, mutable field self-injection (`@Autowired private OrderService self;`) is rejected. Below are three valid ways to fix the issue:
+
+### Approach 1: Using `ObjectProvider<OrderService>`
+Inject `ObjectProvider<OrderService>` via constructor and resolve the proxied bean when invoking `processPayment`. This avoids eager circular bean initialization while keeping both methods in `OrderService`.
+
+```java
+@Service
+public class OrderService {
+
+    private final ObjectProvider<OrderService> self;
+
+    public OrderService(ObjectProvider<OrderService> self) {
+        this.self = self;
+    }
+
+    @Auditable(action = AuditableAction.PROCESS_ORDER)
+    public void placeOrder(String item) {
+        log.info("Action [{}] Placing order for: {}", currentAction(), item);
+        self.getObject().processPayment(item);
+        log.info("Action [{}] Placed order for: {}", currentAction(), item);
+    }
+
+    @Auditable(action = AuditableAction.PROCESS_PAYMENT)
+    public void processPayment(String item) {
+        log.info("Action [{}] Processing payment for: {}", currentAction(), item);
+    }
+}
+```
+
+### Approach 2: Extract `PaymentService` (Best for Single Responsibility)
+Move `processPayment` into a dedicated `PaymentService` collaborator and inject it into `OrderService` via constructor. Calling `paymentService.processPayment(item)` crosses a bean boundary, so it naturally routes through the `PaymentService` CGLIB proxy.
+
+```java
+@Service
+public class PaymentService {
+
+    @Auditable(action = AuditableAction.PROCESS_PAYMENT)
+    public void processPayment(String item) {
+        AuditableAction action = AuditAspect.CURRENT_ACTION.orElse(NO_ACTION);
+        log.info("Action [{}] Processing payment for: {}", action, item);
+    }
+}
+```
+
+```java
+@Service
+public class OrderService {
+
+    private final PaymentService paymentService;
+
+    public OrderService(PaymentService paymentService) {
+        this.paymentService = paymentService;
+    }
+
+    @Auditable(action = AuditableAction.PROCESS_ORDER)
+    public void placeOrder(String item) {
+        log.info("Action [{}] Placing order for: {}", currentAction(), item);
+        paymentService.processPayment(item);
+        log.info("Action [{}] Placed order for: {}", currentAction(), item);
+    }
+}
+```
+
+### Approach 3: Constructor Self-Injection with `@Lazy` (Not Recommended)
+Inject `OrderService` into its own constructor with `@Lazy`. While this satisfies the `final` field rule in `ArchitectureTest` and routes `self.processPayment(item)` through the proxy, it introduces a circular self-reference and masks a service decomposition issue.
+
+```java
+@Service
+public class OrderService {
+
+    private final OrderService self;
+
+    public OrderService(@Lazy OrderService self) {
+        this.self = self;
+    }
+
+    @Auditable(action = AuditableAction.PROCESS_ORDER)
+    public void placeOrder(String item) {
+        log.info("Action [{}] Placing order for: {}", currentAction(), item);
+        self.processPayment(item);
+        log.info("Action [{}] Placed order for: {}", currentAction(), item);
+    }
+
+    @Auditable(action = AuditableAction.PROCESS_PAYMENT)
+    public void processPayment(String item) {
+        log.info("Action [{}] Processing payment for: {}", currentAction(), item);
+    }
+}
+```
+
